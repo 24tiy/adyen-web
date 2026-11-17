@@ -18,6 +18,7 @@ import { SRPanel } from '../../core/Errors/SRPanel';
 import type { CoreConfiguration, ICore } from '../../core/types';
 import type { Order, OrderStatus, PaymentActionsType, PaymentAmount } from '../../types/global-types';
 import type UIElement from '../internal/UIElement/UIElement';
+import type CheckoutSession from '../../core/CheckoutSession';
 import { setupCoreMock } from '../../../config/testMocks/setup-core-mock';
 import { InfoEventType } from '../../core/Analytics/events/AnalyticsInfoEvent';
 import PaymentMethods from '../../core/ProcessResponse/PaymentMethods';
@@ -990,59 +991,91 @@ describe('Dropin', () => {
     });
 
     describe('ANCV order creation', () => {
-        test('should re-enable the pay button and skip the payment when onOrderRequest rejects', async () => {
-            const onOrderRequest = jest.fn((_resolve, reject) => reject(new AdyenCheckoutError('NETWORK_ERROR', 'Order could not be created')));
-            const onSubmit = jest.fn();
-            const onError = jest.fn();
-            const config = getAdyenCheckoutConfiguration({
-                paymentMethodsResponse: { paymentMethods: [{ name: 'ANCV', type: 'ancv' }] },
-                onSubmit,
-                onError
-            });
-            const checkout = await createAdyenCheckout(config);
-            const dropin = new Dropin(checkout, {
-                paymentMethodComponents: [ANCV],
-                openFirstPaymentMethod: true,
-                paymentMethodsConfiguration: { ancv: { onOrderRequest } }
-            });
+        const ancvPaymentMethodsResponse = { paymentMethods: [{ name: 'ANCV', type: 'ancv' }] };
+        const createdOrder = { orderData: 'order-data', pspReference: 'order-psp' };
 
-            render(dropin.render());
-
+        async function payWithANCV(): Promise<HTMLElement> {
             const payButton = await screen.findByRole('button', { name: 'Confirm purchase' });
             const user = userEvent.setup();
             await user.type(screen.getByLabelText(/Your ANCV identification/i), '12345678901');
             await user.click(payButton);
+            return payButton;
+        }
 
-            await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
-            await waitFor(() => expect(payButton).toBeEnabled());
-            expect((dropin.dropinRef)?.state.status.type).toBe('ready');
-            expect(onSubmit).not.toHaveBeenCalled();
+        describe('advanced flow', () => {
+            test('should re-enable the pay button and skip the payment when onOrderRequest rejects', async () => {
+                const onOrderRequest = jest.fn((_resolve, reject) => reject(new AdyenCheckoutError('NETWORK_ERROR', 'Order could not be created')));
+                const onSubmit = jest.fn();
+                const onError = jest.fn();
+                const checkout = await createAdyenCheckout(
+                    getAdyenCheckoutConfiguration({ paymentMethodsResponse: ancvPaymentMethodsResponse, onOrderRequest, onSubmit, onError })
+                );
+                const dropin = new Dropin(checkout, { paymentMethodComponents: [ANCV] });
+
+                render(dropin.render());
+                const payButton = await payWithANCV();
+
+                await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+                await waitFor(() => expect(payButton).toBeEnabled());
+                expect(dropin.dropinRef?.state.status.type).toBe('ready');
+                expect(onSubmit).not.toHaveBeenCalled();
+            });
+
+            test('should make the payment with the created order when onOrderRequest resolves', async () => {
+                const onOrderRequest = jest.fn(resolve => resolve(createdOrder));
+                const onSubmit = jest.fn();
+                const checkout = await createAdyenCheckout(
+                    getAdyenCheckoutConfiguration({ paymentMethodsResponse: ancvPaymentMethodsResponse, onOrderRequest, onSubmit })
+                );
+                const dropin = new Dropin(checkout, { paymentMethodComponents: [ANCV] });
+
+                render(dropin.render());
+                await payWithANCV();
+
+                await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+                expect(onSubmit.mock.calls[0][0].data.order).toEqual(createdOrder);
+                expect(dropin.dropinRef?.state.status.type).toBe('loading');
+            });
         });
 
-        test('should make the payment with the created order when onOrderRequest resolves', async () => {
-            const onOrderRequest = jest.fn(resolve => resolve({ orderData: 'order-data', pspReference: 'order-psp' }));
-            const onSubmit = jest.fn();
-            const config = getAdyenCheckoutConfiguration({
-                paymentMethodsResponse: { paymentMethods: [{ name: 'ANCV', type: 'ancv' }] },
-                onSubmit
+        describe('sessions flow', () => {
+            async function createSessionDropin(session: CheckoutSession, onError?: jest.Mock): Promise<Dropin> {
+                const checkout = await createAdyenCheckout(
+                    getAdyenCheckoutConfiguration({ paymentMethodsResponse: ancvPaymentMethodsResponse, onError })
+                );
+                checkout.session = session;
+                return new Dropin(checkout, { paymentMethodComponents: [ANCV] });
+            }
+
+            test('should re-enable the pay button and skip the payment when the session order could not be created', async () => {
+                const session = mock<CheckoutSession>();
+                session.createOrder.mockRejectedValue(new AdyenCheckoutError('NETWORK_ERROR', 'Order could not be created'));
+                const onError = jest.fn();
+                const dropin = await createSessionDropin(session, onError);
+
+                render(dropin.render());
+                const payButton = await payWithANCV();
+
+                await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+                await waitFor(() => expect(payButton).toBeEnabled());
+                expect(dropin.dropinRef?.state.status.type).toBe('ready');
+                expect(session.createOrder).toHaveBeenCalledTimes(1);
+                expect(session.submitPayment).not.toHaveBeenCalled();
             });
-            const checkout = await createAdyenCheckout(config);
-            const dropin = new Dropin(checkout, {
-                paymentMethodComponents: [ANCV],
-                openFirstPaymentMethod: true,
-                paymentMethodsConfiguration: { ancv: { onOrderRequest } }
+
+            test('should make the payment with the created session order', async () => {
+                const session = mock<CheckoutSession>();
+                session.createOrder.mockResolvedValue({ ...createdOrder, sessionData: 'session-data' });
+                session.submitPayment.mockReturnValue(new Promise(() => {}));
+                const dropin = await createSessionDropin(session);
+
+                render(dropin.render());
+                await payWithANCV();
+
+                await waitFor(() => expect(session.submitPayment).toHaveBeenCalledTimes(1));
+                expect(session.submitPayment.mock.calls[0][0].order).toEqual(createdOrder);
+                expect(dropin.dropinRef?.state.status.type).toBe('loading');
             });
-
-            render(dropin.render());
-
-            const payButton = await screen.findByRole('button', { name: 'Confirm purchase' });
-            const user = userEvent.setup();
-            await user.type(screen.getByLabelText(/Your ANCV identification/i), '12345678901');
-            await user.click(payButton);
-
-            await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
-            expect(onSubmit.mock.calls[0][0].data.order).toEqual({ orderData: 'order-data', pspReference: 'order-psp' });
-            expect((dropin.dropinRef)?.state.status.type).toBe('loading');
         });
     });
 });
